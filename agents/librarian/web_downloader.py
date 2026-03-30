@@ -4,6 +4,8 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Any, Optional
 from functools import wraps
+from urllib.parse import urlparse
+import os
 
 
 def retry_download(method):
@@ -56,19 +58,31 @@ class WebDownloader:
     def fetch_to_callback(
         self, url: str, callback: Callable[[Path, str], Any], **kwargs
     ):
-        """
-        Downloads a file and executes a callback.
-        The TemporaryDirectory is deleted immediately after the block finishes.
-        """
         with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir) / "download_buffer"
+            # 1. Extract the filename from the URL
+            parsed_url = urlparse(url)
+            original_name = os.path.basename(parsed_url.path)
+
+            # Fallback if URL is empty or weird (e.g., https://site.com/)
+            if not original_name or "." not in original_name:
+                original_name = "downloaded_file.bin"
+
+            tmp_path = Path(tmp_dir) / original_name
 
             with self.session.get(url, stream=True, timeout=self.timeout) as r:
                 r.raise_for_status()
+
+                # OPTIONAL: Check Content-Disposition header for a "real" filename
+                # Some servers serve 'download.php?id=123' but header says 'manual.pdf'
+                content_disp = r.headers.get("Content-Disposition")
+                if content_disp and "filename=" in content_disp:
+                    # Very basic parsing of 'attachment; filename="example.pdf"'
+                    filename_part = content_disp.split("filename=")[1].strip("\"'")
+                    tmp_path = Path(tmp_dir) / filename_part
+
                 with open(tmp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=16384):
                         f.write(chunk)
 
-            # The file exists here. Once this callback returns,
-            # the 'with' block ends and the file is nuked.
+            # Pass the correctly named temp file to the Agent
             return callback(tmp_path, source_url=url, **kwargs)
