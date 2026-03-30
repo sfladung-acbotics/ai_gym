@@ -2,11 +2,10 @@ import hashlib
 import json
 import sqlite3
 import shutil
-import uuid
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Any
+from typing import List, Dict
 
 
 @dataclass
@@ -34,31 +33,20 @@ class LibrarianAuditor:
     def _get_quarantine_target(self, file_path: Path) -> Path:
         """
         Surgically identifies the target to move.
-        - If the file is 3+ levels deep (standard hash dir), move the hash dir.
-        - If the file is shallow (e.g., /data/e5/file.txt), move ONLY the file.
+        - If 3+ levels deep (xx/yy/hash/), moves the hash dir.
+        - If shallow (data/e5/file.txt), moves ONLY the file.
         """
         try:
             rel_to_storage = file_path.relative_to(self.agent.storage_path)
-
             # Standard path: xx/yy/hash_string/file.pdf (4 parts)
-            # If we have 3 or more parts, we assume it's an Agent-managed directory.
             if len(rel_to_storage.parts) >= 3:
-                # We want the directory that is the 'hash' folder
-                # e.g., parts is ('e5', 'ab', 'hash_string', 'file.pdf')
-                # target is storage / 'e5' / 'ab' / 'hash_string'
                 return self.agent.storage_path.joinpath(*rel_to_storage.parts[:3])
-
-            # If it's shallow (e.g., 'e5/file.txt' or 'file.txt'), move only the file.
             return file_path
-
         except (ValueError, IndexError):
             return file_path
 
     def _quarantine_entry(self, file_path: Path, reason: str):
-        """Moves the top-level entry containing the file to quarantine."""
         target = self._get_quarantine_target(file_path)
-
-        # Guard: Never move the storage root or the quarantine folder itself
         if target == self.agent.storage_path or target == self.quarantine_path:
             return
 
@@ -70,10 +58,9 @@ class LibrarianAuditor:
             shutil.move(str(target), str(dest))
             print(f" [!] Quarantined: {target.name} -> {dest.name}")
         except Exception as e:
-            print(f" [!] Error moving {target} to quarantine: {e}")
+            print(f" [!] Error moving {target}: {e}")
 
     def _attempt_redownload(self, doc_id_hex: str):
-        """Attempts full restoration via the Agent's remote ingest pipeline."""
         with sqlite3.connect(self.agent.db_path) as conn:
             query = """
                 SELECT p.source_url, d.title, d.domain_data 
@@ -89,22 +76,15 @@ class LibrarianAuditor:
                 url, title, tags_json = row
                 tags = json.loads(tags_json) if tags_json else {}
                 try:
-                    # Re-ingest handles hashing and path recreation
                     print(f" [->] Restoring: {url}")
-                    new_id = self.agent.add_remote_document(url, title=title, tags=tags)
-                    if new_id == doc_id_hex:
-                        print(f" [+] Verified & Restored: {doc_id_hex}")
-                    else:
-                        print(
-                            f" [!] Warning: New download ID {new_id} differs from original."
-                        )
+                    self.agent.add_remote_document(url, title=title, tags=tags)
                 except Exception as e:
-                    print(f" [!] Redownload failed: {e}")
+                    print(f" [!] Restoration failed: {e}")
 
     def run_full_audit(self, repair: bool = False):
         self.report = AuditReport()
         db_entries = {}
-        processed_targets = set()  # Avoid moving same parent dir multiple times
+        processed_targets = set()
 
         with sqlite3.connect(self.agent.db_path) as conn:
             cursor = conn.execute("SELECT doc_id, local_path, sha256 FROM documents")
@@ -118,14 +98,10 @@ class LibrarianAuditor:
 
             rel_path = str(file_path.relative_to(self.agent.root))
             target = self._get_quarantine_target(file_path)
-
-            # If we already quarantined this parent directory in this run, skip
             if target in processed_targets:
                 continue
 
-            problem_found = False
-            reason = ""
-
+            problem_found, reason = False, ""
             if rel_path in db_entries:
                 doc_id_hex, expected_sha = db_entries[rel_path]
                 if self._calculate_hash(file_path) == expected_sha:
@@ -143,11 +119,9 @@ class LibrarianAuditor:
                 self._quarantine_entry(file_path, reason)
                 processed_targets.add(target)
 
-        # 2. Re-verify Missing & Repair
+        # 2. Missing Check
         for rel_path, (doc_id_hex, _) in db_entries.items():
-            # Check if it was moved during the physical scan or is just gone
-            abs_path = self.agent.root / rel_path
-            if not abs_path.exists():
+            if not (self.agent.root / rel_path).exists():
                 self.report.missing.append(
                     {"rel_path": rel_path, "doc_id_hex": doc_id_hex}
                 )
