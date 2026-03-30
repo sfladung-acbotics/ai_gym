@@ -242,9 +242,9 @@ class LibrarianAgent:
             cursor = conn.execute(query, (f"$.{key}", value))
             return cursor.fetchall()
 
-    def perform_audit(self):
+    def perform_audit(self, repair: bool = False):
         auditor = LibrarianAuditor(self)
-        report = auditor.run_full_audit()
+        report = auditor.run_full_audit(repair=repair)
         auditor.print_summary()
         return report
 
@@ -253,4 +253,4 @@ if __name__ == "__main__":
     librarian = LibrarianAgent("~/my_tech_library")
     print(librarian)
     librarian.add_remote_document("https://www.ti.com/lit/ds/symlink/ina950-sep.pdf")
-    librarian.perform_audit()
+    librarian.perform_audit(repair=True)
