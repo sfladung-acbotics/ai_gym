@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-
+from librarian_audit import LibrarianAuditor
 
 from web_downloader import WebDownloader
 
@@ -133,12 +133,38 @@ class LibrarianAgent:
     def add_remote_document(
         self, url: str, title: Optional[str] = None, tags: dict = None
     ):
-        """High-level command to fetch and store a web document."""
+        """High-level command with pre-download verification."""
+        canonical_url = self.downloader.normalize_url(url)
+        head_info = self.downloader.get_head_info(url)
+
+        # Check if we already have this exact version in our provenance
+        if head_info.get("etag") or head_info.get("size"):
+            with sqlite3.connect(self.db_path) as conn:
+                # Search for matching provenance AND metadata_snapshot
+                # We store the etag/size in the snapshot field for comparison
+                query = """
+                    SELECT doc_id FROM provenance 
+                    WHERE source_url = ? AND metadata_snapshot LIKE ?
+                """
+                snapshot_match = f"%{head_info.get('etag')}%{head_info.get('size')}%"
+                existing = conn.execute(
+                    query, (canonical_url, snapshot_match)
+                ).fetchone()
+
+                if existing:
+                    print(
+                        f"Skipping download: {canonical_url} matches existing ETag/Size."
+                    )
+                    return existing[0].hex()
+
+        # If no match, proceed to full download
+        # We pass the head_info into the ingest via tags/kwargs to save it
         return self.downloader.fetch_to_callback(
             url=url,
-            callback=self.ingest,  # The Agent's own ingest method
+            callback=self.ingest,
             title=title,
             tags=tags,
+            head_info=head_info,  # Pass this along to store in provenance
         )
 
     def ingest(
@@ -148,6 +174,7 @@ class LibrarianAgent:
         title: Optional[str] = None,
         tags: Dict[str, Any] = None,
         retriever: Optional[str] = None,
+        **kwargs,
     ):
         """
         Ingests a file and records its unique provenance.
@@ -167,7 +194,8 @@ class LibrarianAgent:
 
         domain_blob = json.dumps(tags or {}, sort_keys=True)
         meta_hash = hashlib.sha256(domain_blob.encode()).hexdigest()
-
+        head_info = kwargs.get("head_info", {})
+        head_blob = json.dumps(head_info)
         with sqlite3.connect(self.db_path) as conn:
             # 2. Update/Insert Document
             conn.execute(
@@ -192,8 +220,8 @@ class LibrarianAgent:
             # We use a random UUID for the event because one doc can have many sources.
             conn.execute(
                 """
-                INSERT INTO provenance (prov_id, doc_id, source_url, retriever_id, retrieved_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO provenance (prov_id, doc_id, source_url, retriever_id, retrieved_at, metadata_snapshot)
+                VALUES (?, ?, ?, ?, ?, ?)
             """,
                 (
                     uuid.uuid4().bytes,
@@ -201,9 +229,9 @@ class LibrarianAgent:
                     source_url,
                     retriever_id,
                     datetime.now(),
+                    head_blob,  # <--- This saves the ETag/Size for future checks
                 ),
             )
-
         return doc_id.hex
 
     def query_by_tag(self, key: str, value: Any):
@@ -214,8 +242,15 @@ class LibrarianAgent:
             cursor = conn.execute(query, (f"$.{key}", value))
             return cursor.fetchall()
 
+    def perform_audit(self):
+        auditor = LibrarianAuditor(self)
+        report = auditor.run_full_audit()
+        auditor.print_summary()
+        return report
+
 
 if __name__ == "__main__":
     librarian = LibrarianAgent("~/my_tech_library")
     print(librarian)
     librarian.add_remote_document("https://www.ti.com/lit/ds/symlink/ina950-sep.pdf")
+    librarian.perform_audit()

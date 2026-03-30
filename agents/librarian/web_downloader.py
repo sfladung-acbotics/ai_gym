@@ -2,10 +2,17 @@ import time
 import requests
 import tempfile
 from pathlib import Path
-from typing import Callable, Any, Optional
+from typing import Callable, Any, Optional, Dict
 from functools import wraps
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 import os
+
+ALLOWED_MIMES = [
+    "application/pdf",
+    "application/octet-stream",  # Often used for firmware/binary blobs
+    "text/plain",
+    "application/zip",
+]
 
 
 def retry_download(method):
@@ -58,31 +65,61 @@ class WebDownloader:
     def fetch_to_callback(
         self, url: str, callback: Callable[[Path, str], Any], **kwargs
     ):
+        # Normalize the URL for the callback/provenance
+        canonical_url = self.normalize_url(url)
+
         with tempfile.TemporaryDirectory() as tmp_dir:
-            # 1. Extract the filename from the URL
             parsed_url = urlparse(url)
-            original_name = os.path.basename(parsed_url.path)
-
-            # Fallback if URL is empty or weird (e.g., https://site.com/)
-            if not original_name or "." not in original_name:
-                original_name = "downloaded_file.bin"
-
+            original_name = os.path.basename(parsed_url.path) or "downloaded_file"
             tmp_path = Path(tmp_dir) / original_name
 
             with self.session.get(url, stream=True, timeout=self.timeout) as r:
                 r.raise_for_status()
 
-                # OPTIONAL: Check Content-Disposition header for a "real" filename
-                # Some servers serve 'download.php?id=123' but header says 'manual.pdf'
+                # 1. MIME CHECK
+                content_type = r.headers.get("Content-Type", "").split(";")[0].lower()
+                if content_type not in ALLOWED_MIMES:
+                    raise ValueError(
+                        f"Unsupported MIME type: {content_type} from {url}"
+                    )
+
+                # 2. Filename Refinement (Content-Disposition)
                 content_disp = r.headers.get("Content-Disposition")
                 if content_disp and "filename=" in content_disp:
-                    # Very basic parsing of 'attachment; filename="example.pdf"'
                     filename_part = content_disp.split("filename=")[1].strip("\"'")
                     tmp_path = Path(tmp_dir) / filename_part
 
+                # 3. Stream to Disk
                 with open(tmp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=16384):
                         f.write(chunk)
 
-            # Pass the correctly named temp file to the Agent
-            return callback(tmp_path, source_url=url, **kwargs)
+            # Pass the canonical_url to the callback instead of the raw one
+            return callback(tmp_path, source_url=canonical_url, **kwargs)
+
+    @staticmethod
+    def normalize_url(url: str) -> str:
+        """Removes query parameters and fragments to get the 'canonical' source."""
+        parsed = urlparse(url)
+        # Reconstruct without query (?) or fragment (#)
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+    def get_head_info(self, url: str) -> Dict[str, Any]:
+        """
+        Performs a HEAD request to gather metadata without downloading the body.
+        Returns a dict with etag, size, and mime.
+        """
+        try:
+            with self.session.head(
+                url, timeout=self.timeout, allow_redirects=True
+            ) as r:
+                r.raise_for_status()
+                return {
+                    "etag": r.headers.get("ETag", "").strip('"'),
+                    "size": int(r.headers.get("Content-Length", 0)),
+                    "mime": r.headers.get("Content-Type", "").split(";")[0].lower(),
+                    "last_modified": r.headers.get("Last-Modified"),
+                }
+        except Exception as e:
+            print(f"[{self.agent_id}] Head check failed for {url}: {e}")
+            return {}
